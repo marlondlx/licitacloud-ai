@@ -3,14 +3,30 @@ import sqlite3
 import pandas as pd
 import hashlib
 import os
+import altair as alt
 from main import extrair_dados_pdf, salvar_no_banco
 
-# Configuração da Página
-st.set_page_config(page_title="LicitaCloud Pro", page_icon="💰", layout="wide")
+# ==============================================================================
+# CONFIGURAÇÃO VISUAL E CSS
+# ==============================================================================
+st.set_page_config(page_title="LicitaCloud AI", page_icon="🚀", layout="wide")
 
-# ==========================================
-# 1. FUNÇÕES DE BANCO E SEGURANÇA
-# ==========================================
+st.markdown("""
+<style>
+    div[data-testid="stMetric"] {
+        background-color: #262730;
+        padding: 20px;
+        border-radius: 10px;
+        border: 1px solid #363945;
+        box-shadow: 2px 2px 10px rgba(0,0,0,0.5);
+    }
+    h1, h2, h3 { font-family: 'Helvetica Neue', sans-serif; }
+</style>
+""", unsafe_allow_html=True)
+
+# ==============================================================================
+# FUNÇÕES DE BANCO E SEGURANÇA
+# ==============================================================================
 def get_conexao():
     return sqlite3.connect("licitacloud.db")
 
@@ -23,7 +39,6 @@ def verificar_login(email, senha):
     cursor.execute("SELECT id, nome, senha_hash FROM usuarios WHERE email = ?", (email,))
     usuario = cursor.fetchone()
     conn.close()
-    
     if usuario and usuario[2] == criar_hash(senha):
         return {"id": usuario[0], "nome": usuario[1]}
     return None
@@ -37,14 +52,13 @@ def criar_usuario(nome, email, senha):
         conn.commit()
         return True
     except sqlite3.IntegrityError:
-        return False # Email já existe
+        return False
     finally:
         conn.close()
 
 def cadastrar_produto(dono_id, nome, tags, custo, venda):
     conn = get_conexao()
     cursor = conn.cursor()
-    # Garante que tags sejam salvas em minúsculo para facilitar a busca
     cursor.execute("""
         INSERT INTO catalogo_produtos (dono_id, nome_produto, tags_match, custo_unitario, preco_venda)
         VALUES (?, ?, ?, ?, ?)
@@ -52,205 +66,193 @@ def cadastrar_produto(dono_id, nome, tags, custo, venda):
     conn.commit()
     conn.close()
 
-# ==========================================
-# 2. INTELIGÊNCIA DE NEGÓCIO (MATCH)
-# ==========================================
 def buscar_produto_compativel(item_edital, df_produtos):
     if df_produtos.empty or not item_edital:
         return "Sem Match", 0.0, 0.0
-    
     item_texto = str(item_edital).lower()
-    
-    # Percorre cada produto do seu catálogo
     for _, produto in df_produtos.iterrows():
         tags = produto['tags_match'].split(',')
-        # Verifica se alguma tag do produto (ex: "i7") está no texto do edital
         match = False
         for tag in tags:
             tag_limpa = tag.strip()
             if len(tag_limpa) > 1 and tag_limpa in item_texto:
                 match = True
                 break
-        
         if match:
             margem = produto['preco_venda'] - produto['custo_unitario']
             return produto['nome_produto'], produto['preco_venda'], margem
-            
-    return "-", 0.0, 0.0
+    return None, 0.0, 0.0
 
-# ==========================================
-# 3. INTERFACE (FRONTEND)
-# ==========================================
+# ==============================================================================
+# INTERFACE DO USUÁRIO
+# ==============================================================================
 
-# Controle de Sessão
 if "usuario_logado" not in st.session_state:
     st.session_state["usuario_logado"] = None
 
-# --- CENÁRIO A: USUÁRIO NÃO LOGADO (TELA DE LOGIN) ---
+# --- TELA DE LOGIN ---
 if st.session_state["usuario_logado"] is None:
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.image("https://cdn-icons-png.flaticon.com/512/2942/2942544.png", width=120)
-        st.title("LicitaCloud Pro")
-        st.markdown("### A Inteligência Artificial que bota dinheiro no seu bolso.")
-        st.info("Automatize a leitura de editais e encontre oportunidades de lucro instantâneas.")
-    
-    with col2:
-        st.write("## Acesso ao Sistema")
-        aba_login, aba_registro = st.tabs(["🔐 Entrar", "📝 Criar Nova Conta"])
+    col_vazia_esq, col_login, col_vazia_dir = st.columns([1, 2, 1])
+    with col_login:
+        st.markdown("<h1 style='text-align: center;'>🚀 LicitaCloud AI</h1>", unsafe_allow_html=True)
+        st.markdown("<p style='text-align: center; color: #888;'>Plataforma de Inteligência para Licitações</p>", unsafe_allow_html=True)
+        st.divider()
+        aba_login, aba_registro = st.tabs(["🔐 Acessar", "📝 Criar Conta"])
         
         with aba_login:
             email_login = st.text_input("E-mail")
             senha_login = st.text_input("Senha", type="password")
-            if st.button("Acessar Painel", type="primary"):
+            if st.button("Entrar no Sistema", use_container_width=True, type="primary"):
                 usuario = verificar_login(email_login, senha_login)
                 if usuario:
                     st.session_state["usuario_logado"] = usuario
                     st.rerun()
                 else:
-                    st.error("E-mail ou senha incorretos.")
+                    st.error("Credenciais inválidas.")
         
         with aba_registro:
-            st.warning("Preencha para começar a lucrar")
-            novo_nome = st.text_input("Seu Nome Completo")
-            novo_email = st.text_input("Seu E-mail (Login)")
-            nova_senha = st.text_input("Sua Senha", type="password")
-            if st.button("Registrar Conta"):
+            novo_nome = st.text_input("Nome")
+            novo_email = st.text_input("E-mail de Cadastro")
+            nova_senha = st.text_input("Senha de Cadastro", type="password")
+            if st.button("Registrar", use_container_width=True):
                 if criar_usuario(novo_nome, novo_email, nova_senha):
-                    st.success("Conta criada com sucesso! Acesse a aba 'Entrar'.")
+                    st.success("Conta criada! Faça login.")
                 else:
-                    st.error("Erro: Esse e-mail já existe.")
+                    st.error("E-mail já existe.")
 
-# --- CENÁRIO B: USUÁRIO LOGADO (DASHBOARD) ---
+# --- DASHBOARD LOGADO ---
 else:
     usuario = st.session_state["usuario_logado"]
+    conn = get_conexao()
     
-    # BARRA LATERAL
     with st.sidebar:
-        st.write(f"👤 **{usuario['nome']}**")
-        st.caption("LicitaCloud Pro v1.0")
-        
-        if st.button("Sair (Logout)"):
+        st.markdown(f"### Olá, {usuario['nome']}")
+        st.caption("LicitaCloud v1.3 (Pro)")
+        st.divider()
+        menu = st.radio("Menu", ["📊 Dashboard Executivo", "📦 Produtos & Preços", "📂 Processar Edital"])
+        st.divider()
+        if st.button("Sair", use_container_width=True):
             st.session_state["usuario_logado"] = None
             st.rerun()
-            
-        st.divider()
-        menu = st.radio("Navegação", ["📊 Dashboard & Lucro", "📦 Meu Catálogo", "📂 Nova Licitação"])
 
-    conn = get_conexao()
-
-    # --- TELA 1: UPLOAD DE EDITAL ---
-    if menu == "📂 Nova Licitação":
-        st.title("Processar Novo Edital")
-        st.markdown("Envie o PDF para a IA extrair as especificações técnicas.")
+    # --- MENU: UPLOAD MÚLTIPLO ---
+    if menu == "📂 Processar Edital":
+        st.title("📂 Processamento em Lote")
+        st.markdown("Arraste **um ou vários** editais (PDF) para a IA processar de uma vez.")
         
-        uploaded_file = st.file_uploader("Arraste seu PDF aqui", type="pdf")
-        if uploaded_file and st.button("Processar Arquivo"):
-            with st.spinner('A IA está lendo o edital...'):
-                temp = f"temp_{uploaded_file.name}"
-                with open(temp, "wb") as f: f.write(uploaded_file.getbuffer())
+        uploaded_files = st.file_uploader("Selecione os arquivos", type="pdf", accept_multiple_files=True)
+        
+        if uploaded_files:
+            qtd = len(uploaded_files)
+            if st.button(f"🚀 Processar {qtd} Editais", type="primary"):
+                prog_bar = st.progress(0)
+                log_box = st.expander("Logs de Processamento", expanded=True)
+                sucessos = 0
                 
-                dados = extrair_dados_pdf(temp)
-                if any(dados.values()):
-                    salvar_no_banco(uploaded_file.name, dados, usuario['id'])
-                    st.success("✅ Edital processado e salvo no Dashboard!")
-                else:
-                    st.warning("⚠️ A IA leu o arquivo, mas não encontrou peças de T.I. relevantes.")
+                for i, file in enumerate(uploaded_files):
+                    prog_bar.progress((i + 1) / qtd)
+                    try:
+                        temp = f"temp_{file.name}"
+                        with open(temp, "wb") as f: f.write(file.getbuffer())
+                        
+                        dados = extrair_dados_pdf(temp)
+                        if any(dados.values()):
+                            salvar_no_banco(file.name, dados, usuario['id'])
+                            log_box.write(f"✅ **{file.name}**: Processado!")
+                            sucessos += 1
+                        else:
+                            log_box.warning(f"⚠️ **{file.name}**: Sem itens de T.I.")
+                        
+                        if os.path.exists(temp): os.remove(temp)
+                    except Exception as e:
+                        log_box.error(f"❌ Erro em {file.name}: {e}")
                 
-                if os.path.exists(temp): os.remove(temp)
+                if sucessos > 0:
+                    st.balloons()
+                    st.success("Processamento Finalizado!")
 
-    # --- TELA 2: CADASTRO DE PRODUTOS ---
-    elif menu == "📦 Meu Catálogo":
-        st.title("Seu Estoque & Preços")
-        st.info("Cadastre aqui os produtos que você vende. A IA usará isso para calcular seu lucro.")
+    # --- MENU: CATÁLOGO ---
+    elif menu == "📦 Produtos & Preços":
+        st.title("📦 Seu Catálogo")
+        c1, c2, c3 = st.columns([2, 1, 1])
+        with c1: nome = st.text_input("Produto", placeholder="Ex: Notebook Dell")
+        with c2: custo = st.number_input("Custo", 0.0)
+        with c3: venda = st.number_input("Venda", 0.0)
+        tags = st.text_input("Tags", placeholder="Ex: i5, 8gb, ssd")
         
-        with st.form("form_produto"):
-            c1, c2 = st.columns(2)
-            nome_prod = c1.text_input("Nome do Produto (Ex: Dell Latitude 3420)")
-            tags_prod = c2.text_input("Palavras-chave para Match (Ex: i5, 8gb, ssd)")
+        if st.button("Salvar Produto", use_container_width=True):
+            cadastrar_produto(usuario['id'], nome, tags, custo, venda)
+            st.success("Salvo!")
+            st.rerun()
             
-            c3, c4 = st.columns(2)
-            custo_prod = c3.number_input("Seu Custo (R$)", min_value=0.0, step=100.0)
-            venda_prod = c4.number_input("Preço de Venda (R$)", min_value=0.0, step=100.0)
-            
-            if st.form_submit_button("💾 Salvar Produto"):
-                cadastrar_produto(usuario['id'], nome_prod, tags_prod, custo_prod, venda_prod)
-                st.success("Produto adicionado ao catálogo!")
-                st.rerun()
-        
-        st.divider()
-        st.subheader("Produtos Cadastrados")
-        df_prods = pd.read_sql_query("SELECT * FROM catalogo_produtos WHERE dono_id = ?", conn, params=(usuario['id'],))
+        df_prods = pd.read_sql_query("SELECT * FROM catalogo_produtos WHERE dono_id=?", conn, params=(usuario['id'],))
         if not df_prods.empty:
             st.dataframe(df_prods[['nome_produto', 'tags_match', 'custo_unitario', 'preco_venda']], use_container_width=True)
         else:
-            st.info("Seu catálogo está vazio.")
+            st.info("Cadastre produtos para habilitar cálculos de lucro.")
 
-    # --- TELA 3: DASHBOARD DE LUCRO ---
-    elif menu == "📊 Dashboard & Lucro":
-        st.title("Painel de Oportunidades")
+    # --- MENU: DASHBOARD (CORRIGIDO) ---
+    elif menu == "📊 Dashboard Executivo":
+        st.title("📊 Visão Geral")
         
-        # Carrega dados
-        df_licitacoes = pd.read_sql_query("SELECT * FROM licitacoes WHERE dono_id=? ORDER BY id DESC", conn, params=(usuario['id'],))
-        # CARREGA AS NOVAS COLUNAS
+        df_lic = pd.read_sql_query("SELECT * FROM licitacoes WHERE dono_id=? ORDER BY id DESC", conn, params=(usuario['id'],))
         df_itens = pd.read_sql_query("SELECT * FROM itens_extraidos", conn)
-        df_meus_produtos = pd.read_sql_query("SELECT * FROM catalogo_produtos WHERE dono_id=?", conn, params=(usuario['id'],))
+        df_prods = pd.read_sql_query("SELECT * FROM catalogo_produtos WHERE dono_id=?", conn, params=(usuario['id'],))
 
-        if not df_licitacoes.empty:
-            escolha = st.selectbox("Selecione o Edital:", df_licitacoes['nome_arquivo'].unique())
-            id_lic = df_licitacoes[df_licitacoes['nome_arquivo'] == escolha]['id'].values[0]
+        if not df_lic.empty:
+            sel = st.selectbox("Contrato:", df_lic['nome_arquivo'].unique())
+            id_lic = df_lic[df_lic['nome_arquivo'] == sel]['id'].values[0]
+            itens_lic = df_itens[df_itens['licitacao_id'] == id_lic].copy()
             
-            # Filtra e Copia
-            itens_da_licitacao = df_itens[df_itens['licitacao_id'] == id_lic].copy()
-            
-            if not itens_da_licitacao.empty:
-                
-                # --- MÉTRICAS DO EDITAL (LIDO DO PDF) ---
-                total_estimado_gov = (itens_da_licitacao['preco_medio_edital'] * itens_da_licitacao['quantidade_edital']).sum()
-                
-                m1, m2 = st.columns(2)
-                m1.metric("Itens Identificados", len(itens_da_licitacao))
-                if total_estimado_gov > 0:
-                    m2.metric("Valor Estimado (Governo)", f"R$ {total_estimado_gov:,.2f}")
+            if not itens_lic.empty:
+                # --- CORREÇÃO DO BUG AQUI ---
+                if not df_prods.empty:
+                    res = itens_lic['valor_encontrado'].apply(lambda x: pd.Series(buscar_produto_compativel(x, df_prods)))
+                    itens_lic[['Produto', 'Venda', 'Lucro']] = res
                 else:
-                    m2.metric("Valor Estimado", "Não encontrado no PDF")
+                    itens_lic['Produto'] = None
+                    itens_lic['Venda'] = 0.0 # <--- AQUI ESTAVA FALTANDO!
+                    itens_lic['Lucro'] = 0.0
 
-                st.markdown("### 📋 Análise Detalhada")
+                # KPIs
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Itens", len(itens_lic))
+                c2.metric("Categorias", itens_lic['tipo_componente'].nunique())
+                val_gov = (itens_lic['preco_medio_edital'] * itens_lic['quantidade_edital']).sum()
+                c3.metric("Estimativa Gov.", f"R$ {val_gov:,.2f}")
+                lucro_total = (itens_lic['Lucro'] * itens_lic['quantidade_edital']).sum()
+                c4.metric("Lucro Potencial", f"R$ {lucro_total:,.2f}", delta=f"{lucro_total:,.2f}" if lucro_total > 0 else None)
+
+                st.divider()
                 
-                if not df_meus_produtos.empty:
-                    # Match
-                    resultados = itens_da_licitacao['valor_encontrado'].apply(
-                        lambda x: pd.Series(buscar_produto_compativel(x, df_meus_produtos))
+                # Gráficos
+                col_g1, col_g2 = st.columns(2)
+                with col_g1:
+                    st.subheader("Categorias")
+                    chart_data = itens_lic['tipo_componente'].value_counts().reset_index()
+                    chart_data.columns = ['Categoria', 'Qtd']
+                    c = alt.Chart(chart_data).mark_bar().encode(x='Qtd', y=alt.Y('Categoria', sort='-x'), color=alt.value('#00D4FF'))
+                    st.altair_chart(c, use_container_width=True)
+                
+                with col_g2:
+                    st.subheader("Análise Financeira")
+                    # Tabela detalhada
+                    display_df = itens_lic.copy()
+                    display_df['Total Venda'] = display_df['Venda'] * display_df['quantidade_edital']
+                    display_df['Total Lucro'] = display_df['Lucro'] * display_df['quantidade_edital']
+                    
+                    st.dataframe(
+                        display_df[['tipo_componente', 'valor_encontrado', 'quantidade_edital', 'Produto', 'Total Lucro']],
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Total Lucro": st.column_config.NumberColumn("Lucro", format="R$ %.2f"),
+                            "Produto": "Sugestão"
+                        }
                     )
-                    
-                    itens_da_licitacao[['Produto Sugerido', 'Preço Venda', 'Margem Unit.']] = resultados
-                    
-                    # CÁLCULO DE LUCRO TOTAL (Margem * Quantidade do Edital)
-                    itens_da_licitacao['Lucro Total Previsto'] = itens_da_licitacao['Margem Unit.'] * itens_da_licitacao['quantidade_edital']
-                    
-                    # Renomeia colunas para ficar bonito na tela
-                    display_df = itens_da_licitacao[[
-                        'tipo_componente', 
-                        'valor_encontrado', 
-                        'quantidade_edital',      # NOVA COLUNA
-                        'preco_medio_edital',     # NOVA COLUNA
-                        'Produto Sugerido', 
-                        'Lucro Total Previsto'
-                    ]]
-                    
-                    display_df.columns = ['Tipo', 'Item Edital', 'Qtd', 'Preço Gov (Est)', 'Nossa Sugestão', 'Lucro Potencial']
-                    
-                    st.dataframe(display_df, use_container_width=True, hide_index=True)
-                    
-                    total_lucro = itens_da_licitacao['Lucro Total Previsto'].sum()
-                    st.success(f"🤑 **Potencial TOTAL de Lucro neste Contrato: R$ {total_lucro:,.2f}**")
-                    
-                else:
-                    st.warning("Cadastre produtos para ver o cálculo de lucro.")
-                    # Mostra tabela simples com as novas colunas
-                    st.dataframe(itens_da_licitacao[['tipo_componente', 'valor_encontrado', 'quantidade_edital', 'preco_medio_edital']], use_container_width=True)
             else:
-                st.info("Nada encontrado.")
+                st.warning("Sem itens técnicos.")
+        else:
+            st.info("Nenhuma licitação processada.")
             
     conn.close()

@@ -2,158 +2,255 @@ import sqlite3
 import pdfplumber
 import re
 import os
+import logging
+from datetime import datetime
 
 # ==============================================================================
-# 1. FUNÇÕES DE LIMPEZA E EXTRAÇÃO FINANCEIRA (V7 - GANANCIOSA)
+# CONFIGURAÇÃO DE LOGS (Para você ver o que a IA está pensando)
 # ==============================================================================
-def limpar_texto(texto):
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# ==============================================================================
+# 1. PADRÕES DE REGEX (A "MEMÓRIA" DA IA)
+# ==============================================================================
+# Compilamos os regex fora da função para ganhar performance
+PATTERNS = {
+    "processador": r"(?:processador|cpu|chip)\s?:?\s?(i[3579]-\d{4,}\w?|ryzen\s?\d\s?\d{4,}\w?|intel\s?core\s?i\d|xeon\s?\w+|epyc)",
+    "ram": r"\b(\d{1,3})\s?(?:gb|giga)\s?(?:ddr[345])?\b|(?:\bddr[345]\b\s?)(?:de\s?)?(\d{1,3}\s?gb)",
+    "armazenamento": r"(ssd\s?(?:de\s?)?\d+\s?(?:gb|tb)|nvme\s?(?:m\.2)?\s?\d+\s?(?:gb|tb)|hd\s?(?:de\s?)?\d+\s?tb)",
+    "monitor": r"(monitor(?:\sled)?|tela)\s(?:de\s)?(\d{2}(?:[\.,]\d)?)\s?(?:pol|legadas|\")|(\d{2,3})\s?hz|full\s?hd|4k\suhd",
+    "impressao": r"(multifuncional|impressora)\s?(?:laser|jato\sde\stinta|tanque)?|toner\s(?:para\s)?([a-z0-9-]+)",
+    "rede": r"(switch)\s(?:de\s)?(\d+)\s(?:portas|pts)|(cat\s?5e|cat\s?6a?)|(patch\scord|cabo\sutp)",
+    "energia": r"(nobreak|ups)\s(?:de\s)?(\d+\.?\d*)\s?(k?va)|(estabilizador)",
+    "perifericos": r"(teclado)\s(?:usb|abnt2)|(mouse)\s(?:optico|usb)|(webcam)\s(?:hd|4k)|(headset)",
+    "software": r"(windows)\s?(10|11)\s?(pro|home)|(office)\s?(2019|2021|365)|(antivirus)"
+}
+
+# Palavras que indicam que NÃO é um item técnico (Filtro de Ruído)
+DENY_LIST = ["licitacao", "pregao", "edital", "objeto", "data", "assinatura", "contrato", "cnpj", "cpf"]
+
+# ==============================================================================
+# 2. FUNÇÕES UTILITÁRIAS (FERRAMENTAS)
+# ==============================================================================
+
+def normalizar_texto(texto):
+    """Limpa caracteres invisíveis e padroniza para minúsculo."""
     if not texto: return ""
-    # Remove caracteres estranhos e espaços duplos
-    return re.sub(r'\s+', ' ', texto.replace('\n', ' ').strip())
+    # Remove quebras de linha e múltiplos espaços
+    texto = re.sub(r'\s+', ' ', texto).strip().lower()
+    return texto
 
-def extrair_valor_monetario(linha):
+def converter_dinheiro(valor_str):
     """
-    V7: Pega valores mesmo sem R$. Procura padrão: numeros.numeros,centavos
-    Ex: Pega '1.500,00' e 'R$ 1500,00'
+    Transforma 'R$ 1.250,00' ou '1.250,00' em float 1250.00
     """
-    # Regex explica: 
-    # (?:r\$\s?)? -> "R$" é opcional
-    # (\d{1,3}(?:\.\d{3})*,\d{2}) -> Padrão brasileiro 1.000,00
-    match = re.search(r'(?:r\$\s?)?(\d{1,3}(?:\.\d{3})*,\d{2})', linha.lower())
-    if match:
-        valor_str = match.group(1).replace('.', '').replace(',', '.')
-        try:
-            return float(valor_str)
-        except:
-            return 0.0
+    try:
+        # Remove R$, espaços e pontos de milhar
+        limpo = valor_str.lower().replace('r$', '').strip()
+        limpo = limpo.replace('.', '') # Remove ponto de milhar (1.000 -> 1000)
+        limpo = limpo.replace(',', '.') # Troca vírgula decimal por ponto (1000,00 -> 1000.00)
+        return float(limpo)
+    except ValueError:
+        return 0.0
+
+def extrair_valor_contexto(bloco_texto):
+    """
+    Busca agressiva por preços no bloco de texto (linhas vizinhas).
+    Prioriza valores com 'R$' explicito.
+    """
+    # 1. Tenta achar com R$ (mais confiável)
+    # Ex: R$ 1.500,00
+    match_moeda = re.search(r'r\$\s?(\d{1,3}(?:\.\d{3})*,\d{2})', bloco_texto)
+    if match_moeda:
+        return converter_dinheiro(match_moeda.group(1))
+    
+    # 2. Se não achar, tenta achar formato monetário XX,XX próximo a palavras chave
+    # Ex: Valor Unit: 1.500,00
+    if "valor" in bloco_texto or "unit" in bloco_texto or "estimado" in bloco_texto:
+        match_num = re.search(r'(\d{1,3}(?:\.\d{3})*,\d{2})', bloco_texto)
+        if match_num:
+            return converter_dinheiro(match_num.group(1))
+            
     return 0.0
 
-def extrair_quantidade(linha):
+def extrair_quantidade_contexto(bloco_texto):
     """
-    V7: Pega números no INÍCIO da linha (padrão de tabela) ou com palavras chaves.
+    Busca quantidade ignorando anos (2025, 2026) e índices (1.1, 1.2).
     """
-    linha = linha.lower().strip()
+    bloco = bloco_texto.lower()
     
-    # Prioridade 1: Palavras explícitas (qtde, quant: 10)
-    match_expl = re.search(r'(?:qtde|qtd|quant|quantidade)[\.:\s]*(\d+)', linha)
-    if match_expl:
-        return int(match_expl.group(1))
-        
-    # Prioridade 2: Número solto no começo da linha (Ex: "10   Computador...")
-    # Pega apenas se for número entre 1 e 9999 (evita pegar código do item tipo 'Item 1.1')
-    match_inicio = re.match(r'^(\d+)\s', linha)
-    if match_inicio:
-        qtd = int(match_inicio.group(1))
-        if 0 < qtd < 10000: 
-            return qtd
-            
-    return 1 # Padrão se não achar nada
+    # Lista de anos para ignorar (evita falso positivo)
+    anos_ignorar = [str(y) for y in range(2020, 2030)]
+    
+    # 1. Busca explícita (qtde: 10)
+    match_expl = re.search(r'(?:qtde|qtd|quant|unid|unidade)[\.:\s]*(\d+)', bloco)
+    if match_expl: 
+        val = int(match_expl.group(1))
+        if str(val) not in anos_ignorar: return val
 
-def validar_lixo(categoria, texto):
+    # 2. Busca o primeiro número inteiro isolado na linha (comum em tabelas)
+    # Ex: "10   Computador..."
+    match_inicio = re.match(r'^(\d+)\s', bloco.strip())
+    if match_inicio:
+        val = int(match_inicio.group(1))
+        # Filtros de sanidade:
+        # - Menor que 10000 (ninguém compra 20 mil computadores num edital comum)
+        # - Não é um ano
+        if 0 < val < 10000 and str(val) not in anos_ignorar:
+            return val
+            
+    return 1 # Padrão seguro
+
+def validar_item(categoria, texto):
+    """O Guardião: Decide se o texto é lixo ou item real."""
     texto = texto.lower()
     
-    # Filtro de tamanho mínimo
-    if len(texto) < 4: return False
+    # Regra 1: Muito curto
+    if len(texto) < 3: return False
     
-    # Filtros específicos por categoria
+    # Regra 2: Está na lista negra?
+    for bad_word in DENY_LIST:
+        if bad_word in texto: return False
+        
+    # Regra 3: Validacoes especificas
     if categoria == "monitor":
-        # Remove lixo como "00 pol" ou polegadas irreais
-        nums = re.findall(r'\d+', texto)
-        if nums:
-            tamanho = int(nums[0])
-            if tamanho < 15 or tamanho > 100: return False # Ignora menor que 15"
-            if texto.startswith("0"): return False # Ignora "00"
-            
+        # Evita '00 polegadas' ou '1.5 polegadas'
+        if "00 pol" in texto or re.search(r'\b[01]\s?pol', texto): return False
+        
     if categoria == "armazenamento":
-        if "idade com ssd" in texto: return False
+        if "idade com ssd" in texto: return False # Erro comum de OCR
         
     return True
 
 # ==============================================================================
-# 2. O CÉREBRO (EXTRAÇÃO V7)
+# 3. CORE: A INTELIGÊNCIA DE EXTRAÇÃO (V9 ENTERPRISE)
 # ==============================================================================
 def extrair_dados_pdf(caminho_pdf):
-    print(f"🔄 Processando V7 (Smath Match): {caminho_pdf}...")
+    logger.info(f"🔄 Iniciando análise profunda em: {caminho_pdf}")
     
-    dados_brutos = {
-        "processador": [], "ram": [], "armazenamento": [], "monitor": [],
-        "impressao": [], "rede": [], "energia": [], "perifericos": [], "software": []
-    }
+    dados_estruturados = {key: [] for key in PATTERNS.keys()}
     
     try:
         with pdfplumber.open(caminho_pdf) as pdf:
-            for pagina in pdf.pages:
+            for i, pagina in enumerate(pdf.pages):
                 texto_pagina = pagina.extract_text()
                 if not texto_pagina: continue
                 
                 linhas = texto_pagina.split('\n')
+                total_linhas = len(linhas)
                 
-                for linha in linhas:
-                    linha_lower = linha.lower()
+                # Itera sobre as linhas da página
+                for idx_linha, linha in enumerate(linhas):
+                    linha_clean = normalizar_texto(linha)
                     
-                    # Dicionário de Regex (Mesmo da versão anterior)
-                    padroes = {
-                        "processador": r"(i[3579]-\d{4,}|ryzen\s?\d|intel\s?core\s?i\d|xeon)",
-                        "ram": r"\b(4|8|16|32|64|128)\s?gb\b",
-                        "armazenamento": r"(ssd\s?(?:de\s?)?\d+\s?(?:gb|tb)|nvme\s?\d+\s?(?:gb|tb)|hd\s?\d+\s?tb)",
-                        # Monitor: Ajustado para ser mais restrito e evitar '00 pol'
-                        "monitor": r"(monitor\sled|\d{2}[\.,]?\d?\s?polegadas|\d{2}\"?\s?pol|full\s?hd)", 
-                        "impressao": r"(multifuncional|impressora\s(?:laser|tanque)|toner\s[a-z0-9]+)",
-                        "rede": r"(switch\s\d+\sportas|cat\s?6|rack\s\d+u|patch\scord)",
-                        "energia": r"(nobreak\s\d+\.?\d*\s?k?va|estabilizador)",
-                        "perifericos": r"(teclado\sabnt2|mouse\soptico|webcam|headset\susb)",
-                        "software": r"(windows\s1[01]\spro|office\s20\d{2})"
-                    }
-
-                    for cat, regex in padroes.items():
-                        match = re.search(regex, linha_lower)
+                    # Para cada categoria de T.I.
+                    for categoria, regex in PATTERNS.items():
+                        match = re.search(regex, linha_clean)
+                        
                         if match:
                             item_encontrado = match.group(0)
                             
-                            if validar_lixo(cat, item_encontrado):
-                                # Extrai Preço e Qtd da MESMA LINHA onde achou o item
-                                qtd = extrair_quantidade(linha_lower)
-                                preco = extrair_valor_monetario(linha_lower)
-                                
-                                dados_brutos[cat].append({
-                                    "desc": item_encontrado,
-                                    "qtd": qtd,
-                                    "preco": preco
-                                })
-        return dados_brutos
+                            # Validação de Qualidade
+                            if not validar_item(categoria, item_encontrado):
+                                continue
+
+                            # --- CONTEXTO EXPANDIDO (VISÃO 360) ---
+                            # Pega a linha anterior, a atual e as 2 próximas
+                            # Isso ajuda quando o preço está acima ou abaixo
+                            contexto = []
+                            if idx_linha > 0: contexto.append(linhas[idx_linha-1]) # Linha anterior
+                            contexto.append(linha) # Atual
+                            if idx_linha + 1 < total_linhas: contexto.append(linhas[idx_linha+1]) # Próxima 1
+                            if idx_linha + 2 < total_linhas: contexto.append(linhas[idx_linha+2]) # Próxima 2
+                            
+                            bloco_texto = " ".join(contexto)
+                            
+                            # Extração Financeira no Bloco
+                            preco = extrair_valor_contexto(bloco_texto)
+                            qtd = extrair_quantidade_contexto(linha_clean) # Qtd geralmente está na mesma linha
+                            
+                            # Log para debug (ajuda a entender erros)
+                            logger.debug(f"[{categoria.upper()}] Item: {item_encontrado} | Preço: {preco} | Qtd: {qtd}")
+                            
+                            # Adiciona aos resultados
+                            dados_estruturados[categoria].append({
+                                "desc": item_encontrado,
+                                "qtd": qtd,
+                                "preco": preco,
+                                "pagina": i + 1 # Bom para auditoria futura
+                            })
+
+        # Remove duplicatas exatas (mesmo item, mesmo preço, mesma qtd)
+        # Isso acontece se o regex pegar a mesma coisa 2x
+        for cat in dados_estruturados:
+            # Truque de Python para remover dicts duplicados em lista
+            dados_estruturados[cat] = [dict(t) for t in {tuple(d.items()) for d in dados_estruturados[cat]}]
+
+        logger.info(f"✅ Análise concluída.")
+        return dados_estruturados
 
     except Exception as e:
-        print(f"❌ Erro: {e}")
+        logger.error(f"❌ Erro crítico ao processar PDF: {e}")
         return {}
 
 # ==============================================================================
-# 3. O SALVADOR (SALVA NO BANCO)
+# 4. CAMADA DE PERSISTÊNCIA (SALVAR NO BANCO)
 # ==============================================================================
 def salvar_no_banco(nome_arquivo, dados_extraidos, dono_id):
-    conexao = sqlite3.connect("licitacloud.db")
-    cursor = conexao.cursor()
-
+    logger.info(f"💾 Persistindo dados para usuário ID {dono_id}...")
+    
+    # Usa Context Manager para garantir que o banco fecha mesmo se der erro
     try:
-        cursor.execute("INSERT INTO licitacoes (dono_id, nome_arquivo, status) VALUES (?, ?, ?)", 
-                       (dono_id, nome_arquivo, 'PROCESSADO'))
-        id_licitacao = cursor.lastrowid 
-        
-        contador = 0
-        for categoria, lista_itens in dados_extraidos.items():
-            for item_obj in lista_itens:
-                item_limpo = limpar_texto(item_obj['desc'])
-                
-                cursor.execute("""
-                    INSERT INTO itens_extraidos (licitacao_id, tipo_componente, valor_encontrado, quantidade_edital, preco_medio_edital)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (id_licitacao, categoria, item_limpo, item_obj['qtd'], item_obj['preco']))
-                contador += 1
-        
-        conexao.commit()
-        print(f"✅ Sucesso! {contador} itens salvos.")
-
+        with sqlite3.connect("licitacloud.db") as conexao:
+            cursor = conexao.cursor()
+            
+            # Registra o Edital
+            cursor.execute("""
+                INSERT INTO licitacoes (dono_id, nome_arquivo, status) 
+                VALUES (?, ?, ?)
+            """, (dono_id, nome_arquivo, 'PROCESSADO'))
+            
+            id_licitacao = cursor.lastrowid
+            
+            contador = 0
+            for categoria, lista_itens in dados_extraidos.items():
+                for item in lista_itens:
+                    cursor.execute("""
+                        INSERT INTO itens_extraidos 
+                        (licitacao_id, tipo_componente, valor_encontrado, quantidade_edital, preco_medio_edital)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (
+                        id_licitacao, 
+                        categoria, 
+                        normalizar_texto(item['desc']), 
+                        item['qtd'], 
+                        item['preco']
+                    ))
+                    contador += 1
+            
+            logger.info(f"✅ Sucesso! {contador} itens gravados na Licitação #{id_licitacao}.")
+            
+    except sqlite3.Error as e:
+        logger.error(f"❌ Erro de Banco de Dados: {e}")
     except Exception as e:
-        print(f"❌ Erro SQL: {e}")
-        conexao.rollback()
-    finally:
-        conexao.close()
+        logger.error(f"❌ Erro genérico ao salvar: {e}")
+
+# ==============================================================================
+# 5. EXECUÇÃO LOCAL (PARA TESTES DE DESENVOLVEDOR)
+# ==============================================================================
+if __name__ == "__main__":
+    # Área de teste rápido - Só roda se você executar 'python main.py' direto
+    arquivo_teste = "edital_exemplo.pdf"
+    if os.path.exists(arquivo_teste):
+        print(f"--- Rodando Teste Local em {arquivo_teste} ---")
+        resultado = extrair_dados_pdf(arquivo_teste)
+        
+        for cat, itens in resultado.items():
+            if itens:
+                print(f"\n📁 Categoria: {cat.upper()}")
+                for item in itens:
+                    print(f"   -> Item: {item['desc']}")
+                    print(f"      Qtd: {item['qtd']} | Preço: R$ {item['preco']:,.2f}")
+    else:
+        print("⚠️ Arquivo de teste não encontrado.")

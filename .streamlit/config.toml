@@ -1,0 +1,10 @@
+[theme]
+primaryColor = "#00D4FF"  # Azul Neon (Botões e Destaques)
+backgroundColor = "#0E1117" # Preto Profundo (Fundo)
+secondaryBackgroundColor = "#262730" # Cinza Escuro (Sidebar e Cards)
+textColor = "#FAFAFA" # Branco (Texto)
+font = "sans serif"
+
+[server]
+headless = true
+enableCORS = false
